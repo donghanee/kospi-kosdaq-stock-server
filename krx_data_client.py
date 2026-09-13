@@ -918,6 +918,33 @@ class KRXAuthManager:
         finally:
             await self._cleanup_browser()
 
+    async def _wait_for_krx_login(self, page, frame) -> None:
+        """HTML 중복 로그인 확인을 처리하고 인증 세션 발급까지 기다립니다."""
+        deadline = time.monotonic() + self.LOGIN_WAIT_TIMEOUT / 1000
+        confirmed = False
+        while time.monotonic() < deadline:
+            cookies = await page.context.cookies(["https://data.krx.co.kr"])
+            if any(cookie["name"] == "mdc.client_session" and cookie.get("value") for cookie in cookies):
+                return
+
+            # KRX renders this confirmation inside the iframe, not as a native
+            # JavaScript dialog. page.on("dialog") cannot accept it.
+            if not confirmed and not frame.is_detached():
+                prompt = frame.get_by_text("이미 로그인된 계정입니다.", exact=False).first
+                if await prompt.is_visible():
+                    for button in await frame.get_by_text("확인", exact=True).all():
+                        if await button.is_visible():
+                            await button.click()
+                            confirmed = True
+                            logger.info("KRX 기존 로그인 종료 확인 완료; 인증 세션 발급 대기")
+                            break
+            await asyncio.sleep(0.25)
+
+        raise KRXAuthError(
+            "KRX 로그인 후 인증 세션(mdc.client_session)이 발급되지 않았습니다. "
+            "로그인 정보 또는 추가 확인 화면을 확인하세요."
+        )
+
     async def _login_async_krx(self) -> bool:
         """비동기 KRX 직접 ID/PW 로그인 처리"""
         try:
@@ -983,8 +1010,9 @@ class KRXAuthManager:
             await login_btn.click()
             logger.info("KRX 로그인 버튼 클릭됨")
 
-            # 로그인 처리 대기 (3초)
-            await asyncio.sleep(3)
+            # Public home pages are reachable without authentication. Complete
+            # any HTML confirmation and require the authenticated cookie first.
+            await self._wait_for_krx_login(page, frame)
 
             # KRX 홈 페이지로 명시적 이동하여 로그인 상태 확인
             # (로그인 성공했어도 로그인 페이지로 리다이렉트되는 KRX 버그 대응)
@@ -1004,7 +1032,7 @@ class KRXAuthManager:
                     f"현재 URL: {current_url[:100]}..."
                 )
 
-            logger.info(f"KRX 직접 로그인 성공! 현재 URL: {current_url}")
+            logger.info("KRX 인증 세션 쿠키 확인 완료; 데이터 페이지 접근 확인")
 
             # 로그인 성공 후 서버 측 세션 안정화 대기 (동시 로그인 경쟁 방지를 위해 랜덤 jitter 추가)
             stabilization_wait = 5 + random.uniform(2, 8)  # 7~13초 랜덤 대기
@@ -1018,19 +1046,18 @@ class KRXAuthManager:
             await page.goto(data_page_url, wait_until="networkidle", timeout=self.PAGE_LOAD_TIMEOUT)
             await asyncio.sleep(3)  # mdc.client_session 쿠키 설정 대기
 
-            # 데이터 조회 페이지에서 리다이렉트되면 세션이 무효화된 것임
-            # (다른 프로세스에서 로그인하여 기존 세션이 만료됨)
+            # A redirect proves authentication failed, but does not identify
+            # whether another process, expiry, or another login condition caused it.
             current_url = page.url
             if "MDCCOMS001" in current_url:
                 logger.warning(
                     f"데이터 조회 페이지에서 로그인 페이지로 리다이렉트됨: {current_url}. "
-                    "다른 프로세스에서 로그인하여 세션이 무효화되었을 수 있습니다. "
                     "브라우저를 재시작하고 재시도합니다."
                 )
                 await self._cleanup_browser()
                 raise KRXSessionExpiredError(
                     "데이터 조회 페이지에서 로그인 페이지로 리다이렉트됨. "
-                    "다른 프로세스의 로그인으로 세션이 무효화되었습니다."
+                    "KRX 인증 세션이 유효하지 않습니다."
                 )
 
             # 쿠키 추출 및 저장 (재시도 로직 포함)
@@ -1050,7 +1077,7 @@ class KRXAuthManager:
 
                 # 2. JavaScript로 document.cookie에서 쿠키 가져오기 (mdc.client_session 포함)
                 js_cookies_str = await page.evaluate("document.cookie")
-                logger.info(f"[시도 {retry+1}/{max_cookie_retries}] JavaScript 쿠키: {js_cookies_str}")
+                logger.debug("JavaScript 쿠키 확인 완료")
 
                 # JavaScript 쿠키 파싱
                 if js_cookies_str:
