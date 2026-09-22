@@ -920,6 +920,8 @@ class KRXAuthManager:
 
     async def _wait_for_krx_login(self, page, frame) -> None:
         """HTML 중복 로그인 확인을 처리하고 인증 세션 발급까지 기다립니다."""
+        from playwright.async_api import Error as PlaywrightError
+
         deadline = time.monotonic() + self.LOGIN_WAIT_TIMEOUT / 1000
         confirmed = False
         while time.monotonic() < deadline:
@@ -927,17 +929,37 @@ class KRXAuthManager:
             if any(cookie["name"] == "mdc.client_session" and cookie.get("value") for cookie in cookies):
                 return
 
-            # KRX renders this confirmation inside the iframe, not as a native
-            # JavaScript dialog. page.on("dialog") cannot accept it.
-            if not confirmed and not frame.is_detached():
-                prompt = frame.get_by_text("이미 로그인된 계정입니다.", exact=False).first
-                if await prompt.is_visible():
-                    for button in await frame.get_by_text("확인", exact=True).all():
-                        if await button.is_visible():
-                            await button.click()
-                            confirmed = True
-                            logger.info("KRX 기존 로그인 종료 확인 완료; 인증 세션 발급 대기")
-                            break
+            # Login navigation may replace the original frame between any two
+            # awaits. Refresh the frames every poll and tolerate only navigation
+            # races; the authenticated cookie above remains the success condition.
+            if not confirmed:
+                for current_frame in page.frames:
+                    if current_frame.is_detached():
+                        continue
+                    try:
+                        prompt = current_frame.get_by_text("이미 로그인된 계정입니다.", exact=False).first
+                        if not await prompt.is_visible():
+                            continue
+                        for button in await current_frame.get_by_text("확인", exact=True).all():
+                            if await button.is_visible():
+                                remaining_ms = (deadline - time.monotonic()) * 1000
+                                if remaining_ms <= 0:
+                                    break
+                                await button.click(timeout=min(1000, remaining_ms))
+                                confirmed = True
+                                logger.info("KRX 기존 로그인 종료 확인 완료; 인증 세션 발급 대기")
+                                break
+                    except PlaywrightError as exc:
+                        message = str(exc).lower()
+                        if not (
+                            "frame was detached" in message
+                            or "frame has been detached" in message
+                            or "execution context was destroyed" in message
+                        ):
+                            raise
+                        logger.debug("KRX 로그인 화면 전환 중; 새 프레임과 인증 세션 재확인")
+                    if confirmed:
+                        break
             await asyncio.sleep(0.25)
 
         raise KRXAuthError(
