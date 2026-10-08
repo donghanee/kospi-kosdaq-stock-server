@@ -444,6 +444,13 @@ class KRXAuthManager:
         except Exception as e:
             logger.warning(f"차단 기록 삭제 실패(무시): {e}")
 
+    async def _goto_ready_document(self, page, url: str):
+        """문서 로딩 후 화면 요소와 인증 쿠키로 준비 상태를 확인합니다."""
+        # KRX keeps background/blob requests open after the document is usable.
+        # Waiting for networkidle can therefore time out before login even starts.
+        # Callers still require the login controls and authenticated session cookie.
+        return await page.goto(url, wait_until="domcontentloaded", timeout=self.PAGE_LOAD_TIMEOUT)
+
     async def _require_login_iframe(self, page):
         """로그인 iframe을 집되, 없으면 왜 없는지 먼저 밝힌다.
 
@@ -771,7 +778,7 @@ class KRXAuthManager:
         try:
             # KRX 로그인 페이지
             login_url = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd"
-            await page.goto(login_url, wait_until="networkidle", timeout=self.PAGE_LOAD_TIMEOUT)
+            await self._goto_ready_document(page, login_url)
             await asyncio.sleep(2)
 
             # iframe에서 카카오 로그인 버튼 클릭
@@ -786,7 +793,7 @@ class KRXAuthManager:
 
             # 카카오 로그인 페이지 대기
             await page.wait_for_url("**/accounts.kakao.com/**", timeout=self.LOGIN_WAIT_TIMEOUT)
-            await page.wait_for_load_state("networkidle")
+            await page.wait_for_load_state("domcontentloaded", timeout=self.PAGE_LOAD_TIMEOUT)
             await asyncio.sleep(1)
 
             # 아이디/비밀번호 입력
@@ -1002,12 +1009,12 @@ class KRXAuthManager:
             # (기존 세션이 있으면 새 로그인 후 mdc.client_session 쿠키가 발급되지 않음)
             logout_url = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D2.cmd"
             logger.info(f"기존 세션 정리를 위해 로그아웃 수행: {logout_url}")
-            await page.goto(logout_url, wait_until="networkidle", timeout=self.PAGE_LOAD_TIMEOUT)
+            await self._goto_ready_document(page, logout_url)
             await asyncio.sleep(10)  # KRX 서버에서 세션 정리 시간 확보 (충분히 대기)
 
             # KRX 로그인 페이지로 이동
             login_url = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd"
-            await page.goto(login_url, wait_until="networkidle", timeout=self.PAGE_LOAD_TIMEOUT)
+            await self._goto_ready_document(page, login_url)
             await asyncio.sleep(2)
 
             # iframe에서 로그인 폼 접근
@@ -1040,7 +1047,7 @@ class KRXAuthManager:
             # (로그인 성공했어도 로그인 페이지로 리다이렉트되는 KRX 버그 대응)
             home_url = "https://data.krx.co.kr/contents/MDC/MAIN/main/index.cmd"
             logger.info(f"홈 페이지로 이동하여 로그인 상태 확인: {home_url}")
-            await page.goto(home_url, wait_until="networkidle", timeout=self.PAGE_LOAD_TIMEOUT)
+            await self._goto_ready_document(page, home_url)
             await asyncio.sleep(2)
 
             # 홈 페이지에서 먼저 로그인 상태 확인
@@ -1065,7 +1072,7 @@ class KRXAuthManager:
             # (mdc.client_session 쿠키는 데이터 조회 페이지에서만 발급됨)
             data_page_url = "https://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201010105"
             logger.info(f"데이터 조회 페이지로 이동하여 mdc.client_session 쿠키 발급: {data_page_url}")
-            await page.goto(data_page_url, wait_until="networkidle", timeout=self.PAGE_LOAD_TIMEOUT)
+            await self._goto_ready_document(page, data_page_url)
             await asyncio.sleep(3)  # mdc.client_session 쿠키 설정 대기
 
             # A redirect proves authentication failed, but does not identify
@@ -1131,7 +1138,7 @@ class KRXAuthManager:
                 # 마지막 시도가 아니면 페이지 새로고침 후 재시도
                 if retry < max_cookie_retries - 1:
                     logger.warning(f"mdc.client_session 쿠키 미발견. 페이지 새로고침 후 재시도...")
-                    await page.reload(wait_until="networkidle")
+                    await page.reload(wait_until="domcontentloaded", timeout=self.PAGE_LOAD_TIMEOUT)
                     await asyncio.sleep(3)
 
             # mdc.client_session이 없으면 세션 만료로 처리하여 retry 로직이 재시도하도록 함
