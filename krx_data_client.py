@@ -56,6 +56,10 @@ from pandas import DataFrame
 
 logger = logging.getLogger(__name__)
 
+# HTTP redirects can change POST to GET and discard the KRX query parameters.
+KRX_ORIGIN = "https://data.krx.co.kr"
+KRX_API_URL = f"{KRX_ORIGIN}/comm/bldAttendant/getJsonData.cmd"
+
 # 타입 힌트용
 T = TypeVar('T')
 
@@ -252,8 +256,8 @@ class KRXAuthManager:
                               "Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "application/json, text/javascript, */*; q=0.01",
                 "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Origin": "http://data.krx.co.kr",
-                "Referer": "http://data.krx.co.kr/",
+                "Origin": KRX_ORIGIN,
+                "Referer": f"{KRX_ORIGIN}/",
             })
         return self._session
 
@@ -531,7 +535,7 @@ class KRXAuthManager:
 
             # 간단한 API 호출로 세션 유효성 체크
             resp = self.session.post(
-                "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd",
+                KRX_API_URL,
                 data={
                     "bld": "dbms/MDC/STAT/standard/MDCSTAT03501",
                     "mktId": "STK",
@@ -540,11 +544,7 @@ class KRXAuthManager:
                 timeout=10
             )
 
-            # 응답이 비어있거나 HTML인 경우 (로그인 필요)
-            content_type = resp.headers.get("Content-Type", "")
-            if "text/html" in content_type:
-                logger.info("HTML 응답 - 로그인 필요")
-                return False
+            resp.raise_for_status()
 
             if not resp.text.strip():
                 logger.info("빈 응답 - 로그인 필요")
@@ -552,8 +552,8 @@ class KRXAuthManager:
 
             try:
                 data = resp.json()
-            except:
-                logger.info("JSON 파싱 실패 - 로그인 필요")
+            except ValueError:
+                logger.info("JSON이 아닌 응답 - 세션 검증 실패")
                 return False
 
             # 로그아웃 상태 체크
@@ -561,7 +561,8 @@ class KRXAuthManager:
                 return False
 
             # 데이터가 있으면 성공
-            if "output" in data or "OutBlock_1" in data:
+            # KRX also returns valid JSON with a text/html Content-Type.
+            if isinstance(data, dict) and ("output" in data or "OutBlock_1" in data):
                 return True
 
             # 빈 데이터도 성공으로 처리 (휴일 등)
@@ -1259,7 +1260,7 @@ class KRXDataClient:
     - 카카오 로그인: KRX_LOGIN_METHOD=kakao, KAKAO_ID, KAKAO_PW
     """
 
-    API_URL = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+    API_URL = KRX_API_URL
     ISIN_CACHE_PATH = Path.home() / ".krx_isin_cache.json"  # ISIN 캐시 파일
     ISIN_CACHE_TTL = timedelta(hours=12)  # 캐시 유효 시간
 
@@ -1409,6 +1410,14 @@ class KRXDataClient:
             else:
                 return []
 
+        except requests.exceptions.JSONDecodeError as e:
+            # Do not log response bodies: an HTML login/error page can contain
+            # session information. Keep enough context to diagnose the transport.
+            raise KRXDataError(
+                "KRX API가 JSON이 아닌 응답을 반환했습니다 "
+                f"(status={resp.status_code}, Content-Type={resp.headers.get('Content-Type', '')}, "
+                f"bytes={len(resp.content)})"
+            ) from e
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 400:
                 # 400 에러의 실제 원인 파악

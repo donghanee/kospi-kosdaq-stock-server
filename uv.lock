@@ -751,7 +751,7 @@ wheels = [
 
 [[package]]
 name = "kospi-kosdaq-stock-server"
-version = "0.4.3.post3"
+version = "0.4.3.post4"
 source = { editable = "." }
 dependencies = [
     { name = "holidays" },
